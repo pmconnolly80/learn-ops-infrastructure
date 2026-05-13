@@ -1483,8 +1483,8 @@ main() {
   detect_platform
   check_prereqs
   check_docker_running
-  check_port_conflicts
   cleanup_docker_resources
+  check_port_conflicts
   ensure_workspace_root
   normalize_infra_location_if_needed "$@"
   clone_workspace_repos
