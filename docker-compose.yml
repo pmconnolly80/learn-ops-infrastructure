@@ -87,4 +87,4 @@ volumes:
   client_node_modules:
 networks:
   learningplatform:
-    external: true
+    name: learningplatform

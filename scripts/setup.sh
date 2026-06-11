@@ -64,10 +64,10 @@ MONARCH_DIR="${ROOT_DIR}/service-monarch"
 # Repo URLs
 # Adjust these if needed.
 #######################################
-API_REPO_URL="https://github.com/System-Explorer-Cohorts/learn-ops-api.git"
-CLIENT_REPO_URL="https://github.com/System-Explorer-Cohorts/learn-ops-client.git"
-INFRA_REPO_URL_DEFAULT="https://github.com/System-Explorer-Cohorts/learn-ops-infrastructure.git"
-MONARCH_REPO_URL="https://github.com/System-Explorer-Cohorts/service-monarch.git"
+API_REPO_URL="git@github.com:System-Explorer-Cohorts/learn-ops-api.git"
+CLIENT_REPO_URL="git@github.com:System-Explorer-Cohorts/learn-ops-client.git"
+INFRA_REPO_URL_DEFAULT="git@github.com:System-Explorer-Cohorts/learn-ops-infrastructure.git"
+MONARCH_REPO_URL="git@github.com:System-Explorer-Cohorts/service-monarch.git"
 NSS_ORG="System-Explorer-Cohorts"
 GITHUB_API="https://api.github.com"
 
@@ -236,6 +236,30 @@ prompt_with_default() {
 
   value="${value:-$default_value}"
   printf -v "${var_name}" '%s' "${value}"
+}
+
+prompt_reuse_secret() {
+  local var_name="$1"
+  local title="$2"
+  local helper="$3"
+  local cached_value="$4"
+
+  if [[ -z "${cached_value}" ]]; then
+    prompt_required "${var_name}" "${title}" "${helper}" true
+    return
+  fi
+
+  echo
+  printf "%b\n" "${BOLD}${MAGENTA}${title}${RESET}"
+  local preview="${cached_value:0:6}••••"
+  printf "%b\n" "${DIM}Saved value found: ${preview}${RESET}"
+
+  if confirm_yes_no "Reuse this saved value?"; then
+    printf -v "${var_name}" '%s' "${cached_value}"
+    ok "Reusing saved ${title}"
+  else
+    prompt_required "${var_name}" "${title}" "${helper}" true
+  fi
 }
 
 confirm_yes_no() {
@@ -618,6 +642,85 @@ normalize_infra_location_if_needed() {
 }
 
 #######################################
+# SSH setup
+#######################################
+ensure_github_ssh() {
+  step "Setting up SSH access to GitHub"
+
+  # Fast path: SSH to GitHub already works — nothing to do.
+  local test_out
+  test_out="$(ssh -o BatchMode=yes -o ConnectTimeout=5 -T git@github.com 2>&1)" || true
+  if echo "${test_out}" | grep -q "successfully authenticated"; then
+    ok "GitHub SSH already configured and working"
+    section_done "GitHub SSH access"
+    return 0
+  fi
+
+  # Find an existing private key or generate a new one.
+  local ssh_key=""
+  for candidate in "${HOME}/.ssh/id_ed25519" "${HOME}/.ssh/id_ecdsa" "${HOME}/.ssh/id_rsa"; do
+    if [[ -f "${candidate}" ]]; then
+      ssh_key="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${ssh_key}" ]]; then
+    substep "No SSH key found — generating a new ed25519 key..."
+    ssh-keygen -t ed25519 -C "${USER_EMAIL}" -f "${HOME}/.ssh/id_ed25519" -N ""
+    ssh_key="${HOME}/.ssh/id_ed25519"
+    ok "SSH key generated: ${ssh_key}"
+  else
+    ok "Found existing SSH key: ${ssh_key}"
+  fi
+
+  # Ensure ssh-agent is running and the key is loaded.
+  if ! ssh-add -l >/dev/null 2>&1; then
+    eval "$(ssh-agent -s)" >/dev/null
+  fi
+  if [[ "${OS_FAMILY}" == "macOS" ]]; then
+    # Prefer the modern --apple-use-keychain flag (macOS Ventura+);
+    # fall back to legacy -K (older macOS), then plain add.
+    ssh-add --apple-use-keychain "${ssh_key}" 2>/dev/null \
+      || ssh-add -K "${ssh_key}" 2>/dev/null \
+      || ssh-add "${ssh_key}"
+  else
+    ssh-add "${ssh_key}"
+  fi
+
+  # Display public key and guide the student to add it to GitHub.
+  echo
+  printf "%b\n" "${BOLD}Your SSH public key — copy everything on the line below:${RESET}"
+  echo
+  cat "${ssh_key}.pub"
+  echo
+  printf "%b\n" "${BOLD}Add this key to GitHub now:${RESET}"
+  printf "   %s\n" "1. Open: https://github.com/settings/ssh/new"
+  printf "   %s\n" "2. Title: Learning Platform"
+  printf "   %s\n" "3. Paste the key above into the 'Key' field"
+  printf "   %s\n" "4. Click 'Add SSH key'"
+  echo
+
+  # Verify the connection — loop until it succeeds.
+  local verified=false
+  while [[ "${verified}" == "false" ]]; do
+    confirm_yes_no "Press Y once you have added the SSH key to GitHub"
+    substep "Verifying SSH connection to GitHub..."
+    local verify_out
+    verify_out="$(ssh -o ConnectTimeout=10 -T git@github.com 2>&1)" || true
+    if echo "${verify_out}" | grep -q "successfully authenticated"; then
+      ok "SSH connection to GitHub verified"
+      verified=true
+    else
+      err "Could not verify connection. GitHub responded: ${verify_out}"
+      warn "Double-check that the key was saved correctly, then try again."
+    fi
+  done
+
+  section_done "GitHub SSH access"
+}
+
+#######################################
 # Clone helpers
 #######################################
 clone_if_missing() {
@@ -676,7 +779,10 @@ clone_workspace_repos() {
 ensure_fork_exists() {
   local repo_name="$1"
 
-  substep "Forking ${NSS_ORG}/${repo_name} to ${GH_USERNAME}..."
+  # NOTE: This function is called via $() substitution so its stdout is captured
+  # as the return value (the SSH URL). All display output MUST go to stderr (&2)
+  # or it will be embedded in the URL that gets set as the git remote.
+  substep "Forking ${NSS_ORG}/${repo_name} to ${GH_USERNAME}..." >&2
 
   local http_code
   http_code="$(curl -s -o /dev/null -w "%{http_code}" \
@@ -690,10 +796,10 @@ ensure_fork_exists() {
       : # success or async — will poll below
       ;;
     403)
-      die "GitHub denied the fork request for ${repo_name}. Ensure your PAT has 'repo' scope."
+      die "GitHub denied the fork request for ${repo_name}. Ensure your PAT has 'repo' scope." >&2
       ;;
     *)
-      die "Unexpected response (HTTP ${http_code}) when forking ${repo_name}."
+      die "Unexpected response (HTTP ${http_code}) when forking ${repo_name}." >&2
       ;;
   esac
 
@@ -708,17 +814,17 @@ ensure_fork_exists() {
       "${GITHUB_API}/repos/${GH_USERNAME}/${repo_name}")"
 
     if [[ "${check_code}" == "200" ]]; then
-      ok "Fork ready: github.com/${GH_USERNAME}/${repo_name}"
-      echo "https://github.com/${GH_USERNAME}/${repo_name}.git"
+      ok "Fork ready: github.com/${GH_USERNAME}/${repo_name}" >&2
+      echo "git@github.com:${GH_USERNAME}/${repo_name}.git"   # ← stdout: the captured URL
       return 0
     fi
 
     attempts=$(( attempts + 1 ))
-    substep "Waiting for fork to become available... (${attempts}/${max_attempts})"
+    substep "Waiting for fork to become available... (${attempts}/${max_attempts})" >&2
     sleep 5
   done
 
-  die "Fork of ${repo_name} did not become available after ${max_attempts} attempts."
+  die "Fork of ${repo_name} did not become available after ${max_attempts} attempts." >&2
 }
 
 # Update git remotes so origin → student fork, upstream → NSS-Workshops.
@@ -799,6 +905,53 @@ PY
 }
 
 #######################################
+# Credential cache (read from .env files)
+#######################################
+parse_env_value() {
+  local file="$1" key="$2"
+  grep -E "^${key}=" "${file}" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+load_cached_credentials() {
+  local api_env="${API_DIR}/.env"
+  local monarch_env="${MONARCH_DIR}/.env"
+
+  CACHED_LEARN_OPS_CLIENT_ID=""
+  CACHED_LEARN_OPS_SECRET_KEY=""
+  CACHED_GITHUB_TOKEN=""
+  CACHED_SLACK_TOKEN=""
+  CACHED_SLACK_WEBHOOK_URL=""
+  CACHED_GH_USERNAME=""
+  CACHED_SUPERUSER_NAME=""
+  CACHED_SUPERUSER_PASSWORD=""
+
+  if [[ -f "${api_env}" ]]; then
+    CACHED_LEARN_OPS_CLIENT_ID="$(parse_env_value "${api_env}" LEARN_OPS_CLIENT_ID)"
+    CACHED_LEARN_OPS_SECRET_KEY="$(parse_env_value "${api_env}" LEARN_OPS_SECRET_KEY)"
+    CACHED_GITHUB_TOKEN="$(parse_env_value "${api_env}" GITHUB_TOKEN)"
+    CACHED_SLACK_TOKEN="$(parse_env_value "${api_env}" SLACK_TOKEN)"
+    CACHED_GH_USERNAME="$(parse_env_value "${api_env}" INSTRUCTOR_USERNAME)"
+    CACHED_SUPERUSER_NAME="$(parse_env_value "${api_env}" LEARN_OPS_SUPERUSER_NAME)"
+    CACHED_SUPERUSER_PASSWORD="$(parse_env_value "${api_env}" LEARN_OPS_SUPERUSER_PASSWORD)"
+  fi
+
+  if [[ -f "${monarch_env}" ]]; then
+    CACHED_SLACK_WEBHOOK_URL="$(parse_env_value "${monarch_env}" SLACK_WEBHOOK_URL)"
+  fi
+
+  # If INSTRUCTOR_USERNAME wasn't written to the .env (older setup run), derive it from the token.
+  if [[ -z "${CACHED_GH_USERNAME}" && -n "${CACHED_GITHUB_TOKEN}" ]]; then
+    CACHED_GH_USERNAME="$(curl -sf -H "Authorization: Bearer ${CACHED_GITHUB_TOKEN}" \
+      https://api.github.com/user 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('login',''))" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "${CACHED_GH_USERNAME}" || -n "${CACHED_GITHUB_TOKEN}" ]]; then
+    ok "Found saved credentials — will offer to reuse them."
+  fi
+}
+
+#######################################
 # Env file writers
 #######################################
 overwrite_prompt_if_exists() {
@@ -843,6 +996,7 @@ replacements = {
     "LEARN_OPS_SUPERUSER_PASSWORD=": "LEARN_OPS_SUPERUSER_PASSWORD=${LEARN_OPS_SUPERUSER_PASSWORD}",
     "SLACK_TOKEN=": "SLACK_TOKEN=${SLACK_TOKEN}",
     "GITHUB_TOKEN=": "GITHUB_TOKEN=${GITHUB_TOKEN}",
+    "INSTRUCTOR_USERNAME=": "INSTRUCTOR_USERNAME=${GH_USERNAME}",
 }
 
 lines = text.splitlines()
@@ -932,13 +1086,26 @@ collect_user_identity() {
   prompt_with_default USER_FIRST_NAME "First name" "Confirm or update your first name" "${git_fname}"
   prompt_with_default USER_LAST_NAME  "Last name"  "Confirm or update your last name"  "${git_lname}"
   prompt_with_default USER_EMAIL      "Email"      "Confirm or update your email"       "${git_email}"
-  prompt_required     GH_USERNAME     "GitHub username" "Your GitHub handle (no @)" false
+
+  if [[ -n "${CACHED_GH_USERNAME}" ]]; then
+    prompt_with_default GH_USERNAME "GitHub username" "Your GitHub handle (no @)" "${CACHED_GH_USERNAME}"
+  else
+    prompt_required GH_USERNAME "GitHub username" "Your GitHub handle (no @)" false
+  fi
 
   section_done "Identity confirmed"
 }
 
 
 prompt_github_pat() {
+  if [[ -n "${CACHED_GITHUB_TOKEN}" ]]; then
+    prompt_reuse_secret GITHUB_TOKEN \
+      "GitHub Personal Access Token" \
+      "Paste a new token if you want to replace it (starts with ghp_)" \
+      "${CACHED_GITHUB_TOKEN}"
+    return
+  fi
+
   echo
   printf "%b\n" "${BOLD}Follow these steps to create your Personal Access Token:${RESET}"
   echo
@@ -1115,28 +1282,36 @@ collect_config() {
   substep "A few values are required to wire up GitHub, Slack, and your local Django admin user."
   substep "Instructor-provided values are still needed here; setup cannot invent them for you."
 
-  prompt_required \
-    LEARN_OPS_CLIENT_ID \
-    "Learn Ops Client ID" \
-    "Your instructor should provide this value."
+  if [[ -n "${CACHED_LEARN_OPS_CLIENT_ID}" ]]; then
+    prompt_with_default \
+      LEARN_OPS_CLIENT_ID \
+      "Learn Ops Client ID" \
+      "Your instructor should provide this value." \
+      "${CACHED_LEARN_OPS_CLIENT_ID}"
+  else
+    prompt_required \
+      LEARN_OPS_CLIENT_ID \
+      "Learn Ops Client ID" \
+      "Your instructor should provide this value."
+  fi
 
-  prompt_required \
+  prompt_reuse_secret \
     LEARN_OPS_SECRET_KEY \
     "Learn Ops Secret Key" \
     "Your instructor should provide this value." \
-    true
+    "${CACHED_LEARN_OPS_SECRET_KEY}"
 
-  prompt_required \
+  prompt_reuse_secret \
     SLACK_TOKEN \
     "Slack Token" \
     "Used by the API and Monarch service for Slack integration." \
-    true
+    "${CACHED_SLACK_TOKEN}"
 
-  prompt_required \
+  prompt_reuse_secret \
     SLACK_WEBHOOK_URL \
     "Slack Webhook URL" \
     "Used by Monarch to post migration status messages." \
-    true
+    "${CACHED_SLACK_WEBHOOK_URL}"
 
   prompt_github_pat
 
@@ -1147,13 +1322,13 @@ collect_config() {
     LEARN_OPS_SUPERUSER_NAME \
     "Local Django Admin Username" \
     "This is only for your local development environment." \
-    "admin"
+    "${CACHED_SUPERUSER_NAME:-admin}"
 
   prompt_with_default \
     LEARN_OPS_SUPERUSER_PASSWORD \
     "Local Django Admin Password" \
     "This is only for your local development environment." \
-    "admin"
+    "${CACHED_SUPERUSER_PASSWORD:-admin}"
 
   section_done "Configuration collection"
 }
@@ -1332,13 +1507,6 @@ maybe_start_services() {
   substep "This command uses the docker-compose.yml in learn-ops-infrastructure."
 
   if confirm_yes_no "Start services now?"; then
-    if ! docker network inspect learningplatform >/dev/null 2>&1; then
-      docker network create learningplatform
-      ok "Created Docker network: learningplatform"
-    else
-      ok "Docker network 'learningplatform' already exists"
-    fi
-
     (
       cd "${TARGET_INFRA_DIR}"
       docker compose up -d
@@ -1405,7 +1573,16 @@ cleanup_docker_resources() {
     while IFS= read -r img; do
       [[ -n "$img" ]] && raw_images+=("$img")
     done < <(docker images --filter "label=com.docker.compose.project=${project}" \
-               --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+               --format '{{if ne .Repository "<none>"}}{{.Repository}}:{{.Tag}}{{else}}{{.ID}}{{end}}' 2>/dev/null || true)
+  done
+
+  # Also catch named volumes directly via compose label (survives container removal)
+  for project in "${projects[@]}"; do
+    while IFS= read -r vol; do
+      [[ -n "$vol" ]] && raw_volumes+=("$vol")
+    done < <(docker volume ls \
+               --filter "label=com.docker.compose.project=${project}" \
+               --format '{{.Name}}' 2>/dev/null || true)
   done
 
   # Deduplicate images and volumes (docker handles duplicates gracefully, but keep output clean)
@@ -1471,6 +1648,123 @@ doctor_mode() {
 }
 
 #######################################
+# Save instructor state to fixture
+#######################################
+save_instructor_state() {
+  step "Saving instructor state for future resets"
+
+  local container="learning-platform-api"
+  local out_file="${API_DIR}/LearningAPI/fixtures/instructor_${GH_USERNAME}.json"
+
+  if ! docker ps --filter "name=^${container}$" --filter "status=running" \
+       --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
+    warn "API container not running — skipping instructor state save"
+    return
+  fi
+
+  local py_code
+  py_code="$(cat <<'PYEOF'
+import json, sys
+from django.contrib.auth.models import User
+from allauth.socialaccount.models import SocialAccount
+from LearningAPI.models.people import NssUser, NssUserCohort
+from rest_framework.authtoken.models import Token
+
+username = '__GH_USERNAME__'
+u = User.objects.filter(username=username).first()
+if not u:
+    print(f'User {username!r} not found', file=sys.stderr)
+    raise SystemExit(1)
+
+nss_user   = NssUser.objects.filter(user=u).first()
+social     = SocialAccount.objects.filter(user=u).first()
+cohort_rec = NssUserCohort.objects.filter(nss_user=nss_user).first() if nss_user else None
+token      = Token.objects.filter(user=u).first()
+
+data = []
+
+data.append({
+    'model': 'auth.user',
+    'pk': u.pk,
+    'fields': {
+        'password': u.password,
+        'last_login': u.last_login.isoformat() if u.last_login else None,
+        'is_superuser': u.is_superuser,
+        'username': u.username,
+        'first_name': u.first_name,
+        'last_name': u.last_name,
+        'email': u.email,
+        'is_staff': u.is_staff,
+        'is_active': u.is_active,
+        'date_joined': u.date_joined.isoformat(),
+        'groups': list(u.groups.values_list('pk', flat=True)),
+        'user_permissions': [],
+    }
+})
+
+if nss_user:
+    data.append({
+        'model': 'LearningAPI.nssuser',
+        'pk': nss_user.pk,
+        'fields': {
+            'user': u.pk,
+            'slack_handle': nss_user.slack_handle,
+            'github_handle': nss_user.github_handle,
+        }
+    })
+
+if social:
+    extra = social.extra_data if isinstance(social.extra_data, str) else json.dumps(social.extra_data)
+    data.append({
+        'model': 'socialaccount.socialaccount',
+        'pk': social.pk,
+        'fields': {
+            'user': u.pk,
+            'provider': social.provider,
+            'uid': social.uid,
+            'last_login': social.last_login.isoformat() if social.last_login else None,
+            'date_joined': social.date_joined.isoformat(),
+            'extra_data': extra,
+        }
+    })
+
+if cohort_rec:
+    data.append({
+        'model': 'LearningAPI.nssusercohort',
+        'pk': cohort_rec.pk,
+        'fields': {
+            'nss_user': nss_user.pk,
+            'cohort': cohort_rec.cohort.pk,
+            'is_github_org_member': cohort_rec.is_github_org_member,
+        }
+    })
+
+if token:
+    data.append({
+        'model': 'authtoken.token',
+        'pk': token.key,
+        'fields': {
+            'user': u.pk,
+            'created': token.created.isoformat(),
+        }
+    })
+
+with open('/tmp/instructor_fixture.json', 'w') as f:
+    json.dump(data, f, indent=2)
+print(f'Fixture written for {username}')
+PYEOF
+)"
+  py_code="${py_code//__GH_USERNAME__/${GH_USERNAME}}"
+
+  docker exec "${container}" python3 manage.py shell -c "${py_code}"
+  docker cp "${container}:/tmp/instructor_fixture.json" "${out_file}"
+
+  ok "Saved: ${out_file}"
+  warn "This file contains your token — do not commit it to git."
+  section_done "Instructor state"
+}
+
+#######################################
 # Main
 #######################################
 main() {
@@ -1487,8 +1781,10 @@ main() {
   check_port_conflicts
   ensure_workspace_root
   normalize_infra_location_if_needed "$@"
-  clone_workspace_repos
+  load_cached_credentials
   collect_user_identity
+  ensure_github_ssh
+  clone_workspace_repos
   collect_config
   setup_student_forks
   write_env_files
@@ -1498,6 +1794,7 @@ main() {
   maybe_start_services
   run_oauth_flow
   elevate_to_instructor
+  save_instructor_state
 
   echo
   printf "%b\n" "${GREEN}${BOLD}All done.${RESET}"
