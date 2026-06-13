@@ -795,6 +795,9 @@ ensure_fork_exists() {
     200|202)
       : # success or async — will poll below
       ;;
+    401)
+      die "GitHub rejected your token (HTTP 401) when forking ${repo_name}. The token is expired, revoked, or invalid. Re-run setup and paste a new PAT." >&2
+      ;;
     403)
       die "GitHub denied the fork request for ${repo_name}. Ensure your PAT has 'repo' scope." >&2
       ;;
